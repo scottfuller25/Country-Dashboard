@@ -1,5 +1,3 @@
-# Country-Dashboard
-A dashboard that tracks key indicators
 Canada Economic Monitor
 A Streamlit dashboard that answers one question: how is Canada's economy
 performing right now, and how does that compare with recent history? It pulls
@@ -22,6 +20,10 @@ python app.py --refresh              # first pull + verification log (~10 s)
 streamlit run app.py                 # open http://localhost:8501
 ```
 No API keys are needed. Both APIs are free and public.
+Deploying to Streamlit Community Cloud: put `app.py` and `requirements.txt`
+side by side at the repo root, choose Python 3.12, and set the main file to
+`app.py`. Charts use Altair, which installs with Streamlit, so the app runs
+even if the host skips `requirements.txt`.
 ---
 2. Indicators
 Six indicators, shown in five charts. Use Indicators to display in the sidebar
