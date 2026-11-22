@@ -56,7 +56,10 @@ DEFAULT_VIEW_START_YEAR = 2015          # default chart window start
 HTTP_TIMEOUT = 45
 HTTP_RETRIES = 3
 
-ET = ZoneInfo("America/Toronto")        # StatCan and BoC publish on Eastern time
+try:                                    # StatCan and BoC publish on Eastern time
+    ET = ZoneInfo("America/Toronto")
+except Exception:                       # noqa: BLE001  (no tz database available)
+    ET = timezone(timedelta(hours=-5), "ET")
 
 VALET_URL = "https://www.bankofcanada.ca/valet/observations/{codes}/json"
 WDS_URL = ("https://www150.statcan.gc.ca/t1/wds/rest/"
@@ -547,7 +550,7 @@ def _period_label(d: pd.Timestamp, frequency: str) -> str:
 
 
 def run_dashboard() -> None:
-    import plotly.graph_objects as go
+    import altair as alt
     import streamlit as st
 
     st.set_page_config(page_title="Canada Economic Monitor", layout="wide",
@@ -604,15 +607,18 @@ def run_dashboard() -> None:
                     "Statistics Canada and the Bank of Canada.")
 
         # Refresh status - deliberately separate from observation dates
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Last successful refresh", _fmt_ts(meta.get("last_success_utc")))
         next_due = (datetime.fromisoformat(meta["last_success_utc"])
                     + timedelta(hours=REFRESH_HOURS)).isoformat() \
             if meta.get("last_success_utc") else None
-        c2.metric("Next scheduled refresh", _fmt_ts(next_due))
-        status = meta.get("last_status", "n/a")
-        c3.metric("Last attempt", f"{status.upper()}",
-                  help=f"Attempted {_fmt_ts(meta.get('last_attempt_utc'))}")
+        status = meta.get("last_status", "n/a").upper()
+        c1, c2, c3 = st.columns(3)
+        for col, label, value in [
+                (c1, "Last successful refresh", _fmt_ts(meta.get("last_success_utc"))),
+                (c2, "Next scheduled refresh", _fmt_ts(next_due)),
+                (c3, "Last attempt", f"{status} · {_fmt_ts(meta.get('last_attempt_utc'))}")]:
+            col.markdown(f"<div style='font-size:0.85rem;opacity:0.75'>{label}</div>"
+                         f"<div style='font-size:1.15rem;font-weight:600'>{value}</div>",
+                         unsafe_allow_html=True)
         if meta.get("errors"):
             st.warning("Some series could not be refreshed and show their last "
                        "cached values: " + "; ".join(
@@ -630,7 +636,7 @@ def run_dashboard() -> None:
         with tab_charts:
             view_start = pd.Timestamp(f"{start_year}-01-01")
             for name in chosen:
-                INDICATORS[name](st, go, obs, view_start, fx_invert)
+                INDICATORS[name](st, alt, obs, view_start, fx_invert)
                 st.divider()
         with tab_data:
             _render_data_tab(st, obs, meta)
@@ -639,39 +645,97 @@ def run_dashboard() -> None:
 
 
 # ------------------------------ chart helpers ------------------------------ #
-def _base_layout(fig, y_title: str, height: int = 380):
-    fig.update_layout(
-        height=height, margin=dict(l=10, r=10, t=10, b=10),
-        hovermode="x unified", plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
-                    font=dict(color=INK_2)),
-        font=dict(color=INK_2, size=13),
-    )
-    fig.update_xaxes(showgrid=False, linecolor="#d6d5d0", ticks="outside",
-                     tickcolor="#d6d5d0")
-    fig.update_yaxes(title_text=y_title, gridcolor="rgba(0,0,0,0.07)",
-                     zeroline=True, zerolinecolor="#b9b8b2")
-    return fig
+# Charts use Altair, which is installed automatically with Streamlit, so the
+# dashboard needs no plotting package beyond Streamlit itself.
+GRID, AXIS = "#e6e5e0", "#b9b8b2"
 
 
-def _line(go, df, name, color, fmt, step=False, width=2):
-    return go.Scatter(x=df["date"], y=df["value"], name=name, mode="lines",
-                      line=dict(color=color, width=width,
-                                shape="hv" if step else "linear"),
-                      hovertemplate=f"%{{y:{fmt}}}<extra>{name}</extra>")
+def _long(*pairs) -> pd.DataFrame:
+    """[(df, series_name), ...] -> long frame with date/value/series."""
+    parts = [df.assign(series=name) for df, name in pairs if not df.empty]
+    if not parts:
+        return pd.DataFrame(columns=["date", "value", "series"])
+    return pd.concat(parts, ignore_index=True)[["date", "value", "series"]]
+
+
+def _chart(alt, df: pd.DataFrame, colors: dict, y_title: str, fmt: str,
+           date_fmt: str = "%b %Y", step=(), bars=(), y_domain=None,
+           band=None, target=None, height: int = 360):
+    """Line/bar chart with a hover crosshair and a tooltip listing every series."""
+    alt.data_transformers.disable_max_rows()
+    names = [n for n in colors if n in set(df["series"])]
+    color = alt.Color("series:N", sort=names, title=None,
+                      scale=alt.Scale(domain=names, range=[colors[n] for n in names]),
+                      legend=alt.Legend(orient="top", labelColor=INK_2,
+                                        symbolStrokeWidth=3) if len(names) > 1 else None)
+    yscale = alt.Scale(domain=list(y_domain), clamp=True) if y_domain else alt.Scale(zero=False)
+    x = alt.X("date:T", title=None, axis=alt.Axis(grid=False, domainColor=AXIS,
+                                                    tickColor=AXIS, labelColor=INK_2))
+    y = alt.Y("value:Q", title=y_title, scale=yscale,
+              axis=alt.Axis(gridColor=GRID, domain=False, tickColor=AXIS,
+                            labelColor=INK_2, titleColor=INK_2))
+    base = alt.Chart(df)
+    layers = []
+    if band:
+        layers.append(alt.Chart(pd.DataFrame({"y0": [band[0]], "y1": [band[1]]}))
+                      .mark_rect(color=NEUTRAL, opacity=0.13)
+                      .encode(y=alt.Y("y0:Q", scale=yscale), y2="y1:Q"))
+    if target is not None:
+        layers.append(alt.Chart(pd.DataFrame({"y": [target]}))
+                      .mark_rule(color=NEUTRAL, strokeDash=[2, 3], strokeWidth=1)
+                      .encode(y=alt.Y("y:Q", scale=yscale)))
+
+    def subset(keys):
+        return base.transform_filter(alt.FieldOneOfPredicate(field="series", oneOf=list(keys)))
+
+    bar_k = [n for n in names if n in bars]
+    step_k = [n for n in names if n in step and n not in bars]
+    line_k = [n for n in names if n not in bars and n not in step]
+    if bar_k:
+        layers.append(subset(bar_k).mark_bar(clip=True)  # note: cornerRadius + clip hides bars in Vega
+                      .encode(x=x, y=y, color=color))
+    if line_k:
+        layers.append(subset(line_k).mark_line(strokeWidth=2, clip=True)
+                      .encode(x=x, y=y, color=color))
+    if step_k:
+        layers.append(subset(step_k).mark_line(strokeWidth=2, clip=True,
+                                               interpolate="step-after")
+                      .encode(x=x, y=y, color=color))
+
+    # Hover: nearest date -> vertical rule + markers + one tooltip with all series
+    hover = alt.selection_point(nearest=True, on="pointerover", fields=["date"],
+                                empty=False, clear="pointerout")
+    tips = [alt.Tooltip("date:T", title="Date", format=date_fmt)] + [
+        alt.Tooltip(field=n, type="quantitative", title=n, format=fmt) for n in names]
+    layers.append(base.transform_pivot("series", value="value", groupby=["date"])
+                  .mark_rule(color=AXIS, strokeWidth=1)
+                  .encode(x="date:T",
+                          opacity=alt.condition(hover, alt.value(1), alt.value(0)),
+                          tooltip=tips)
+                  .add_params(hover))
+    layers.append(base.mark_point(filled=True, size=70, stroke="white", strokeWidth=2,
+                                  clip=True)
+                  .encode(x=x, y=y, color=color,
+                          opacity=alt.condition(hover, alt.value(1), alt.value(0))))
+    return (alt.layer(*layers).properties(height=height)
+            .configure_view(stroke=None)
+            .configure_axis(labelFontSize=12, titleFontSize=12)
+            .configure_legend(labelFontSize=13))
+
+
+def _show(st, chart):
+    st.altair_chart(chart, width="stretch")
 
 
 def _meta_block(st, rows: list[tuple[str, str]]):
-    md = "\n".join(f"- **{k}:** {v}" for k, v in rows)
-    st.markdown(md)
+    st.markdown("\n".join(f"- **{k}:** {v}" for k, v in rows))
 
 
 def _latest(df: pd.DataFrame):
     return df["date"].iloc[-1], float(df["value"].iloc[-1])
 
 
-def chart_gdp(st, go, obs, view_start, fx_invert):
+def chart_gdp(st, alt, obs, view_start, fx_invert):
     s = SERIES["gdp"]
     lvl = series_frame(obs, "gdp")
     if lvl.empty:
@@ -684,34 +748,31 @@ def chart_gdp(st, go, obs, view_start, fx_invert):
     k2.metric(f"Change from a year earlier, {d:%b %Y}", f"{yoy['value'].iloc[-1]:+.1f}%")
     k3.metric("Level (annualized)", f"${v / 1e6:,.3f} trillion")
     m, y = mom[mom.date >= view_start], yoy[yoy.date >= view_start]
-    fig = go.Figure()
-    fig.add_bar(x=m["date"], y=m["value"], name="Month-over-month %",
-                marker=dict(color=C1, line=dict(width=0)),
-                hovertemplate="%{y:+.2f}%<extra>Month-over-month</extra>")
-    fig.add_trace(_line(go, y, "Year-over-year %", C2, "+.2f"))
-    _base_layout(fig, "Percent change")
-    fig.update_layout(bargap=0.15)
-    # COVID-era swings (-11% m/m) would flatten everything else
-    lo, hi = min(m["value"].min(), y["value"].min()), max(m["value"].max(), y["value"].max())
-    if view_start.year <= 2021 and (lo < -4 or hi > 6):
-        fig.update_yaxes(range=[-4, 6])
-        st.caption("Y-axis clipped to −4%…+6% so recent movements are readable; "
+    y_domain = None
+    lo = min(m["value"].min(), y["value"].min())
+    hi = max(m["value"].max(), y["value"].max())
+    if lo < -4 or hi > 6:   # pandemic swings (-11% m/m) would flatten everything else
+        y_domain = (-4, 6)
+    df = _long((m, "Month-over-month %"), (y, "Year-over-year %"))
+    _show(st, _chart(alt, df, {"Month-over-month %": C1, "Year-over-year %": C2},
+                     "Percent change", "+.2f", bars=("Month-over-month %",),
+                     y_domain=y_domain))
+    if y_domain:
+        st.caption("Y-axis limited to −4%…+6% so recent movements are readable; "
                    "2020–21 pandemic swings extend beyond it (hover for values).")
-    st.plotly_chart(fig, width="stretch")
     _meta_block(st, [
-        ("Series", f"{s.name}"),
+        ("Series", s.name),
         ("Units", f"{s.units}; plotted as % change"),
         ("Frequency / adjustment", f"{s.frequency}; {s.adjustment}"),
         ("Source", f"[{s.source_label}]({s.url})"),
         ("Latest observation", _period_label(d, s.frequency)),
-        ("Transformation", "Month-over-month % = 100×(GDPₜ/GDPₜ₋₁ − 1). "
-         "Year-over-year % = 100×(GDPₜ/GDPₜ₋₁₂ − 1). Monthly m/m changes are not "
-         "annualized. Monthly GDP by industry differs slightly from the quarterly "
-         "expenditure-based GDP headline."),
+        ("Transformation", "Month-over-month % = 100×(GDPₜ/GDPₜ₋₁ − 1) (bars, not "
+         "annualized). Year-over-year % = 100×(GDPₜ/GDPₜ₋₁₂ − 1) (line). Monthly GDP "
+         "by industry differs slightly from the quarterly expenditure-based headline."),
     ])
 
 
-def chart_cpi(st, go, obs, view_start, fx_invert):
+def chart_cpi(st, alt, obs, view_start, fx_invert):
     cpi = series_frame(obs, "cpi")
     if cpi.empty:
         return st.info("CPI data unavailable.")
@@ -726,18 +787,12 @@ def chart_cpi(st, go, obs, view_start, fx_invert):
         k2.metric(f"CPI-trim, {trim['date'].iloc[-1]:%b %Y}", f"{trim['value'].iloc[-1]:.1f}%")
     if not med.empty:
         k3.metric(f"CPI-median, {med['date'].iloc[-1]:%b %Y}", f"{med['value'].iloc[-1]:.1f}%")
-    fig = go.Figure()
-    fig.add_hrect(y0=1, y1=3, fillcolor=NEUTRAL, opacity=0.12, line_width=0)
-    fig.add_hline(y=2, line=dict(color=NEUTRAL, width=1, dash="dot"),
-                  annotation_text="2% target (1–3% range shaded)",
-                  annotation_font_color=INK_2, annotation_position="top left")
-    fig.add_trace(_line(go, yoy[yoy.date >= view_start], "Headline CPI", C1, ".1f"))
-    if not trim.empty:
-        fig.add_trace(_line(go, trim[trim.date >= view_start], "CPI-trim", C2, ".1f"))
-    if not med.empty:
-        fig.add_trace(_line(go, med[med.date >= view_start], "CPI-median", C3, ".1f"))
-    _base_layout(fig, "% change from 12 months earlier")
-    st.plotly_chart(fig, width="stretch")
+    df = _long((yoy[yoy.date >= view_start], "Headline CPI"),
+               (trim[trim.date >= view_start], "CPI-trim"),
+               (med[med.date >= view_start], "CPI-median"))
+    _show(st, _chart(alt, df, {"Headline CPI": C1, "CPI-trim": C2, "CPI-median": C3},
+                     "% change from 12 months earlier", ".1f", band=(1, 3), target=2))
+    st.caption("Shaded: Bank of Canada 1–3% inflation-control range; dotted: 2% target.")
     a, t = SERIES["cpi"], SERIES["cpi_trim"]
     _meta_block(st, [
         ("Units", "Percent change from the same month a year earlier"),
@@ -748,12 +803,11 @@ def chart_cpi(st, go, obs, view_start, fx_invert):
         ("Latest observation", _period_label(d, "Monthly")),
         ("Transformation", "Headline: computed here from the all-items index "
          "(2002=100) as 100×(CPIₜ/CPIₜ₋₁₂ − 1), rounded to 1 decimal as StatCan "
-         "publishes. CPI-trim/median are published by StatCan already as 12-month "
-         "% changes (no transformation)."),
+         "publishes. CPI-trim/median are published already as 12-month % changes."),
     ])
 
 
-def chart_unemp(st, go, obs, view_start, fx_invert):
+def chart_unemp(st, alt, obs, view_start, fx_invert):
     s = SERIES["unemp"]
     df = series_frame(obs, "unemp")
     if df.empty:
@@ -767,10 +821,8 @@ def chart_unemp(st, go, obs, view_start, fx_invert):
               delta_color="inverse")
     if not yr.empty:
         k2.metric("A year earlier", f"{yr['value'].iloc[0]:.1f}%")
-    fig = go.Figure(_line(go, df[df.date >= view_start], "Unemployment rate", C1, ".1f"))
-    _base_layout(fig, "Percent of labour force")
-    fig.update_layout(showlegend=False)
-    st.plotly_chart(fig, width="stretch")
+    _show(st, _chart(alt, _long((df[df.date >= view_start], "Unemployment rate")),
+                     {"Unemployment rate": C1}, "Percent of labour force", ".1f"))
     _meta_block(st, [
         ("Units", s.units), ("Frequency / adjustment", f"{s.frequency}; {s.adjustment}"),
         ("Source", f"[{s.source_label}]({s.url})"),
@@ -779,7 +831,7 @@ def chart_unemp(st, go, obs, view_start, fx_invert):
     ])
 
 
-def chart_rates(st, go, obs, view_start, fx_invert):
+def chart_rates(st, alt, obs, view_start, fx_invert):
     pol, y2, y10 = (series_frame(obs, k) for k in ("policy", "gov2y", "gov10y"))
     if pol.empty and y2.empty:
         return st.info("Interest-rate data unavailable.")
@@ -794,20 +846,19 @@ def chart_rates(st, go, obs, view_start, fx_invert):
         sp = y10.merge(y2, on="date", suffixes=("_10", "_2"))
         k[3].metric("10y − 2y spread",
                     f"{(sp['value_10'].iloc[-1] - sp['value_2'].iloc[-1]) * 100:+.0f} bp")
-    fig = go.Figure()
-    fig.add_trace(_line(go, pol[pol.date >= view_start], "Policy rate (target overnight)",
-                        C1, ".2f", step=True))
-    fig.add_trace(_line(go, y2[y2.date >= view_start], "2-year GoC yield", C2, ".2f", width=1.5))
-    fig.add_trace(_line(go, y10[y10.date >= view_start], "10-year GoC yield", C3, ".2f", width=1.5))
-    _base_layout(fig, "Percent")
-    st.plotly_chart(fig, width="stretch")
-    d = max(df["date"].iloc[-1] for df in (pol, y2, y10) if not df.empty)
+    names = {"Policy rate": C1, "2-year GoC yield": C2, "10-year GoC yield": C3}
+    df = _long((pol[pol.date >= view_start], "Policy rate"),
+               (y2[y2.date >= view_start], "2-year GoC yield"),
+               (y10[y10.date >= view_start], "10-year GoC yield"))
+    _show(st, _chart(alt, df, names, "Percent", ".2f", date_fmt="%b %d, %Y",
+                     step=("Policy rate",)))
+    d = max(df_["date"].iloc[-1] for df_ in (pol, y2, y10) if not df_.empty)
     _meta_block(st, [
         ("Units", "Percent per annum"),
-        ("Frequency", "Daily (business days); policy rate drawn as a step line"),
-        ("Source", "Bank of Canada Valet: [V39079]"
-         f"({SERIES['policy'].url}), [BD.CDN.2YR.DQ.YLD and BD.CDN.10YR.DQ.YLD]"
-         f"({SERIES['gov2y'].url})"),
+        ("Frequency", "Daily (business days); policy rate (target for the overnight "
+         "rate) drawn as a step line"),
+        ("Source", f"Bank of Canada Valet: [V39079]({SERIES['policy'].url}), "
+         f"[BD.CDN.2YR.DQ.YLD and BD.CDN.10YR.DQ.YLD]({SERIES['gov2y'].url})"),
         ("Latest observation", f"{d:%Y-%m-%d}"),
         ("Transformation", "None. Spread = 10-year minus 2-year yield, in basis "
          "points. Benchmark yields are mid-market closes of selected GoC issues; "
@@ -815,17 +866,17 @@ def chart_rates(st, go, obs, view_start, fx_invert):
     ])
 
 
-def chart_fx(st, go, obs, view_start, fx_invert):
+def chart_fx(st, alt, obs, view_start, fx_invert):
     s = SERIES["usdcad"]
     df = series_frame(obs, "usdcad")
     if df.empty:
         return st.info("Exchange-rate data unavailable.")
     if fx_invert:
         df = df.assign(value=1 / df["value"])
-        lab, units, fmt = "CAD/USD", "US dollars per 1 Canadian dollar", ".4f"
+        lab, units = "CAD/USD", "US dollars per 1 Canadian dollar"
         note = "Rising line = Canadian dollar appreciating."
     else:
-        lab, units, fmt = "USD/CAD", s.units, ".4f"
+        lab, units = "USD/CAD", s.units
         note = "Rising line = Canadian dollar depreciating (more CAD per USD)."
     d, v = _latest(df)
     yr = df[df.date <= d - pd.DateOffset(years=1)]
@@ -834,10 +885,8 @@ def chart_fx(st, go, obs, view_start, fx_invert):
     k1.metric(f"{lab}, {d:%d %b %Y}", f"{v:.4f}")
     if not yr.empty:
         k2.metric("Change over 12 months", f"{100 * (v / yr['value'].iloc[-1] - 1):+.1f}%")
-    fig = go.Figure(_line(go, df[df.date >= view_start], lab, C1, fmt, width=1.5))
-    _base_layout(fig, units)
-    fig.update_layout(showlegend=False)
-    st.plotly_chart(fig, width="stretch")
+    _show(st, _chart(alt, _long((df[df.date >= view_start], lab)), {lab: C1},
+                     units, ".4f", date_fmt="%b %d, %Y"))
     _meta_block(st, [
         ("Quotation convention", "Bank of Canada quotes 1 unit of foreign currency "
          "in Canadian dollars, i.e. USD/CAD = CAD per 1 USD. " + note),
@@ -935,3 +984,4 @@ if _running_in_streamlit():
     run_dashboard()
 elif __name__ == "__main__":
     sys.exit(cli())
+
