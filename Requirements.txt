@@ -1,6 +1,8 @@
 # Canada Economic Monitor - Python 3.12
+# Streamlit brings pandas, requests and altair (used for the charts) with it,
+# so the app also runs if a host installs nothing beyond Streamlit.
 streamlit>=1.50,<2
-plotly>=5.24,<7
 pandas>=2.2,<4
 requests>=2.32,<3
-tzdata>=2024.1   # IANA time zones for zoneinfo on Windows
+altair>=5.4,<7
+tzdata>=2024.1
